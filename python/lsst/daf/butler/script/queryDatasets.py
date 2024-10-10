@@ -29,12 +29,15 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any
+from itertools import groupby
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 from astropy.table import Table as AstropyTable
 
 from .._butler import Butler
+from .._exceptions import MissingDatasetTypeError
+from .._query_all_datasets import DatasetsPage, query_all_datasets
 from ..cli.utils import sortAstropyTable
 from ..utils import has_globs
 
@@ -241,17 +244,24 @@ class QueryDatasets:
             Dataset references matching the given query criteria grouped
             by dataset type.
         """
-        datasetTypes = self._dataset_type_glob
         query_collections: Iterable[str] = self._collections_wildcard or ["*"]
 
-        # Currently need to use old interface to get all the matching
-        # dataset types and loop over the dataset types executing a new
-        # query each time.
-        dataset_types = set(self.butler.registry.queryDatasetTypes(datasetTypes or ...))
-        n_dataset_types = len(dataset_types)
-        if n_dataset_types == 0:
-            _LOG.info("The given dataset type, %s, is not known to this butler.", datasetTypes)
-            return
+        with self.butler.query() as query:
+            try:
+                pages = query_all_datasets(
+                    self.butler,
+                    query,
+                    name=self._dataset_type_glob,
+                )
+                datasets_found = 0
+                for dataset_type, refs in _chunk_by_dataset_type(pages):
+                    yield refs
+                    datasets_found += len(refs)
+
+                    _LOG.debug("Got %d results for dataset type %s", len(refs), dataset_type)
+            except MissingDatasetTypeError as e:
+                _LOG.info(str(e))
+                return
 
         # Expand the collections query and include summary information.
         query_collections_info = self.butler.collections.query_info(
@@ -271,11 +281,6 @@ class QueryDatasets:
         dataset_type_collections = self.butler.collections._group_by_dataset_type(
             dataset_type_names, query_collections_info
         )
-
-        if (n_filtered := len(dataset_type_collections)) != n_dataset_types:
-            _LOG.info("Filtered %d dataset types down to %d", n_dataset_types, n_filtered)
-        else:
-            _LOG.info("Processing %d dataset type%s", n_dataset_types, "" if n_dataset_types == 1 else "s")
 
         # Accumulate over dataset types.
         limit = self._limit
@@ -309,7 +314,6 @@ class QueryDatasets:
                     # We asked for one too many so must remove that from
                     # the list.
                     results.pop(-1)
-            _LOG.debug("Got %d results for dataset type %s", len(results), dt)
             yield results
 
             if not unlimited and limit == 0:
@@ -320,3 +324,16 @@ class QueryDatasets:
                         self._limit,
                     )
                 break
+
+
+class _GroupedDatasetRefs(NamedTuple):
+    dataset_type: str
+    refs: list[DatasetRef]
+
+
+def _chunk_by_dataset_type(pages: Iterator[DatasetsPage]) -> Iterator[_GroupedDatasetRefs]:
+    for dataset_type, chunk in groupby(pages, lambda page: page.dataset_type):
+        refs = []
+        for page in chunk:
+            refs.extend(page.data.rows)
+        yield _GroupedDatasetRefs(dataset_type, refs)
